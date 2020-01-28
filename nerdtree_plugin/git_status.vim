@@ -57,6 +57,15 @@ if !exists('s:NERDTreeIndicatorMap')
                 \ }
 endif
 
+let s:supports_async =
+    \ (
+    \     (v:version >= 800 && exists('*job_start'))
+    \         || (has('nvim') && exists('*jobstart'))
+    \ )
+
+let s:is_async =
+    \ (exists('g:nerdtree_git_async') && g:nerdtree_git_async)
+        \ && s:supports_async
 
 function! NERDTreeGitStatusRefreshListener(event)
     if !exists('b:NOT_A_GIT_REPOSITORY')
@@ -71,12 +80,48 @@ function! NERDTreeGitStatusRefreshListener(event)
 endfunction
 
 " FUNCTION: g:NERDTreeGitStatusRefresh() {{{2
+
 " refresh cached git status
 function! g:NERDTreeGitStatusRefresh()
+    " clear the existing cache
     let b:NERDTreeCachedGitFileStatus = {}
     let b:NERDTreeCachedGitDirtyDir   = {}
-    let b:NOT_A_GIT_REPOSITORY        = 1
 
+    let b:NOT_A_GIT_REPOSITORY = 1
+
+    " should i do a sync update or start an async one?
+    if s:is_async
+        call s:NERDTreeGitStatusRefreshAsync()
+    else
+        call s:NERDTreeGitStatusRefreshSync()
+    endif
+endfunction
+
+function! s:NERDTreeGitStatusRefreshSync()
+    let l:gitcmd = s:NERDTreeGitStatusRefreshCommand()
+    let l:statusesStr = system(l:gitcmd)
+    call s:NERDTreeGitStatusRefreshUpdateCache(l:statusesStr)
+endfunction
+
+function! s:NERDTreeGitStatusRefreshAsync()
+    call s:NERDTreeGitStopAsyncRefresh()
+
+    let l:argv = [ &shell, &shellcmdflag, s:NERDTreeGitStatusRefreshCommand() ]
+
+    if has('nvim')
+        let s:job = jobstart(l:argv, {
+            \ 'out_cb':  function('s:NERDTreeGitStatusRefresh_AsyncProgress'),
+            \ 'exit_cb': function('s:NERDTreeGitStatusRefresh_AsyncExit')
+            \ })
+    else
+        let s:job = job_start(l:argv, {
+            \ 'out_cb':  function('s:NERDTreeGitStatusRefresh_AsyncProgress'),
+            \ 'exit_cb': function('s:NERDTreeGitStatusRefresh_AsyncExit')
+            \ })
+    endif
+endfunction
+
+function! s:NERDTreeGitStatusRefreshCommand()
     let l:root = fnamemodify(b:NERDTree.root.path.str(), ':p:gs?\\?/?:S')
     let l:gitcmd = 'git -c color.status=false -C ' . l:root . ' status -s'
     if g:NERDTreeShowIgnoredStatus
@@ -88,12 +133,16 @@ function! g:NERDTreeGitStatusRefresh()
             let l:gitcmd = l:gitcmd . '=' . g:NERDTreeGitStatusIgnoreSubmodules
         endif
     endif
-    let l:statusesStr = system(l:gitcmd)
-    let l:statusesSplit = split(l:statusesStr, '\n')
+    return l:gitcmd
+endfunction
+
+function! s:NERDTreeGitStatusRefreshUpdateCache(statuses)
+    let l:statusesSplit = split(a:statuses, '\n')
     if l:statusesSplit != [] && l:statusesSplit[0] =~# 'fatal:.*'
         let l:statusesSplit = []
         return
     endif
+
     let b:NOT_A_GIT_REPOSITORY = 0
 
     for l:statusLine in l:statusesSplit
@@ -121,6 +170,33 @@ function! g:NERDTreeGitStatusRefresh()
             call s:NERDTreeCacheDirtyDir(l:pathStr)
         endif
     endfor
+endfunction
+
+function! s:NERDTreeGitStopAsyncRefresh()
+	if exists('s:job')
+		if has('nvim')
+			call jobstop(s:job)
+		else
+			call job_stop(s:job)
+		endif
+		unlet s:job
+    endif
+endfunction
+
+function! s:NERDTreeGitStatusRefresh_AsyncProgress(job, data, ...)
+    call s:NERDTreeGitStatusRefreshUpdateCache(a:data)
+endfunction
+
+function! s:NERDTreeGitStatusRefresh_AsyncExit(...)
+	if exists('s:job')
+		unlet s:job
+	endif
+
+    call s:NERDTreeGitStopAsyncRefresh()
+
+    " force a nerdtree refresh
+    call b:NERDTree.root.refreshFlags()
+    call NERDTreeRender()
 endfunction
 
 function! s:NERDTreeCacheDirtyDir(pathStr)
@@ -313,7 +389,8 @@ function! s:FileUpdate(fname)
         let l:node = l:node.parent
     endwhile
 
-    call NERDTreeRender()
+    " this will force an update
+    call s:CursorHoldUpdate()
 
     exec l:altwinnr . 'wincmd w'
     exec l:winnr . 'wincmd w'
