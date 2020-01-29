@@ -67,12 +67,17 @@ let s:is_async =
     \ (exists('g:nerdtree_git_async') && g:nerdtree_git_async)
         \ && s:supports_async
 
+function! s:get_key(tree)
+    return a:tree.GetWinNum()
+endfunction
+
 function! NERDTreeGitStatusRefreshListener(event)
-    if !exists('b:NOT_A_GIT_REPOSITORY')
-        call g:NERDTreeGitStatusRefresh()
+    let l:key = s:get_key(a:event.nerdtree)
+    if !exists('s:refresh_data['.l:key.']') || !exists('s:refresh_data['.l:key.'].not_git')
+        call g:NERDTreeGitStatusRefresh(a:event.nerdtree)
     endif
     let l:path = a:event.subject
-    let l:flag = g:NERDTreeGetGitStatusPrefix(l:path)
+    let l:flag = g:NERDTreeGetGitStatusPrefix(a:event.nerdtree, l:path)
     call l:path.flagSet.clearFlags('git')
     if l:flag !=# ''
         call l:path.flagSet.addFlag('git', l:flag)
@@ -80,49 +85,56 @@ function! NERDTreeGitStatusRefreshListener(event)
 endfunction
 
 " FUNCTION: g:NERDTreeGitStatusRefresh() {{{2
+let s:refresh_data = { }
 
 " refresh cached git status
-function! g:NERDTreeGitStatusRefresh()
-    " clear the existing cache
-    let b:NERDTreeCachedGitFileStatus = {}
-    let b:NERDTreeCachedGitDirtyDir   = {}
+function! g:NERDTreeGitStatusRefresh(tree)
+    let l:key = s:get_key(a:tree)
 
-    let b:NOT_A_GIT_REPOSITORY = 1
+    let s:refresh_data[l:key] = {
+        \ 'file_status': { },
+        \ 'dirty_dir': { },
+        \ 'not_git': 1
+        \ }
 
     " should i do a sync update or start an async one?
     if s:is_async
-        call s:NERDTreeGitStatusRefreshAsync()
+        call s:NERDTreeGitStatusRefreshAsync(a:tree)
     else
-        call s:NERDTreeGitStatusRefreshSync()
+        call s:NERDTreeGitStatusRefreshSync(a:tree)
     endif
 endfunction
 
-function! s:NERDTreeGitStatusRefreshSync()
-    let l:gitcmd = s:NERDTreeGitStatusRefreshCommand()
+function! s:NERDTreeGitStatusRefreshSync(tree)
+    let l:key = s:get_key(a:tree)
+    let l:gitcmd = s:NERDTreeGitStatusRefreshCommand(a:tree)
     let l:statusesStr = system(l:gitcmd)
-    call s:NERDTreeGitStatusRefreshUpdateCache(l:statusesStr)
+    call s:NERDTreeGitStatusRefreshUpdateCache(a:tree, l:statusesStr)
 endfunction
 
-function! s:NERDTreeGitStatusRefreshAsync()
-    call s:NERDTreeGitStopAsyncRefresh()
+function! s:NERDTreeGitStatusRefreshAsync(tree)
+    let l:key = s:get_key(a:tree)
+    let l:refresh_data = s:refresh_data[l:key]
 
-    let l:argv = [ &shell, &shellcmdflag, s:NERDTreeGitStatusRefreshCommand() ]
+    call s:NERDTreeGitStopAsyncRefresh(l:key)
+
+    let l:argv = [ &shell, &shellcmdflag, s:NERDTreeGitStatusRefreshCommand(a:tree) ]
 
     if has('nvim')
-        let s:job = jobstart(l:argv, {
-            \ 'out_cb':  function('s:NERDTreeGitStatusRefresh_AsyncProgress'),
-            \ 'exit_cb': function('s:NERDTreeGitStatusRefresh_AsyncExit')
+        let l:refresh_data.job = jobstart(l:argv, {
+            \ 'out_cb':  function('s:NERDTreeGitStatusRefresh_AsyncProgress', [ a:tree ]),
+            \ 'exit_cb': function('s:NERDTreeGitStatusRefresh_AsyncExit', [ a:tree ])
             \ })
     else
-        let s:job = job_start(l:argv, {
-            \ 'out_cb':  function('s:NERDTreeGitStatusRefresh_AsyncProgress'),
-            \ 'exit_cb': function('s:NERDTreeGitStatusRefresh_AsyncExit')
+        let l:refresh_data.job = job_start(l:argv, {
+            \ 'out_cb':  function('s:NERDTreeGitStatusRefresh_AsyncProgress', [ a:tree ]),
+            \ 'exit_cb': function('s:NERDTreeGitStatusRefresh_AsyncExit', [ a:tree ])
             \ })
     endif
 endfunction
 
-function! s:NERDTreeGitStatusRefreshCommand()
-    let l:root = fnamemodify(b:NERDTree.root.path.str(), ':p:gs?\\?/?:S')
+function! s:NERDTreeGitStatusRefreshCommand(tree)
+    let l:root = fnamemodify(a:tree.root.path.str(), ':p:gs?\\?/?:S')
     let l:gitcmd = 'git -c color.status=false -C ' . l:root . ' status -s'
     if g:NERDTreeShowIgnoredStatus
         let l:gitcmd = l:gitcmd . ' --ignored'
@@ -136,21 +148,23 @@ function! s:NERDTreeGitStatusRefreshCommand()
     return l:gitcmd
 endfunction
 
-function! s:NERDTreeGitStatusRefreshUpdateCache(statuses)
+function! s:NERDTreeGitStatusRefreshUpdateCache(tree, statuses)
     let l:statusesSplit = split(a:statuses, '\n')
     if l:statusesSplit != [] && l:statusesSplit[0] =~# 'fatal:.*'
         let l:statusesSplit = []
         return
     endif
 
-    let b:NOT_A_GIT_REPOSITORY = 0
+    let l:key = s:get_key(a:tree)
+    let l:refresh_data = s:refresh_data[l:key]
+    let l:refresh_data.not_git = 0
 
     for l:statusLine in l:statusesSplit
         " cache git status of files
         let l:pathStr = substitute(l:statusLine, '...', '', '')
         let l:pathSplit = split(l:pathStr, ' -> ')
         if len(l:pathSplit) == 2
-            call s:NERDTreeCacheDirtyDir(l:pathSplit[0])
+            call s:NERDTreeCacheDirtyDir(l:key, l:pathSplit[0])
             let l:pathStr = l:pathSplit[1]
         else
             let l:pathStr = l:pathSplit[0]
@@ -160,54 +174,57 @@ function! s:NERDTreeGitStatusRefreshUpdateCache(statuses)
             continue
         endif
         let l:statusKey = s:NERDTreeGetFileGitStatusKey(l:statusLine[0], l:statusLine[1])
-        let b:NERDTreeCachedGitFileStatus[fnameescape(l:pathStr)] = l:statusKey
+        let l:refresh_data.file_status[fnameescape(l:pathStr)] = l:statusKey
 
         if l:statusKey == 'Ignored'
             if isdirectory(l:pathStr)
-                let b:NERDTreeCachedGitDirtyDir[fnameescape(l:pathStr)] = l:statusKey
+                let l:refresh_data.dirty_dir[fnameescape(l:pathStr)] = l:statusKey
             endif
         else
-            call s:NERDTreeCacheDirtyDir(l:pathStr)
+            call s:NERDTreeCacheDirtyDir(l:key, l:pathStr)
         endif
     endfor
 endfunction
 
-function! s:NERDTreeGitStopAsyncRefresh()
-	if exists('s:job')
+function! s:NERDTreeGitStopAsyncRefresh(key)
+	if exists('s:refresh_data['.a:key.']') && exists('s:refresh_data['.a:key.'].job')
+	    let l:job = s:refresh_data[a:key].job
 		if has('nvim')
-			call jobstop(s:job)
+			call jobstop(l:job)
 		else
-			call job_stop(s:job)
+			call job_stop(l:job)
 		endif
-		unlet s:job
+		unlet s:refresh_data[a:key].job
     endif
 endfunction
 
-function! s:NERDTreeGitStatusRefresh_AsyncProgress(job, data, ...)
-    call s:NERDTreeGitStatusRefreshUpdateCache(a:data)
+function! s:NERDTreeGitStatusRefresh_AsyncProgress(tree, job, data, ...)
+    call s:NERDTreeGitStatusRefreshUpdateCache(a:tree, a:data)
 endfunction
 
-function! s:NERDTreeGitStatusRefresh_AsyncExit(...)
-	if exists('s:job')
-		unlet s:job
+function! s:NERDTreeGitStatusRefresh_AsyncExit(tree, ...)
+    let l:key = s:get_key(a:tree)
+	if exists('s:refresh_data['.l:key.'].job')
+		unlet s:refresh_data[l:key].job
 	endif
 
-    call s:NERDTreeGitStopAsyncRefresh()
-
     " force a nerdtree refresh
-    call b:NERDTree.root.refreshFlags()
-    call NERDTreeRender()
+    call a:tree.root.refreshFlags()
+    if exists('b:NERDTree')
+        call NERDTreeRender()
+    endif
 endfunction
 
-function! s:NERDTreeCacheDirtyDir(pathStr)
+function! s:NERDTreeCacheDirtyDir(key, pathStr)
     " cache dirty dir
     let l:dirtyPath = s:NERDTreeTrimDoubleQuotes(a:pathStr)
     if l:dirtyPath =~# '\.\./.*'
         return
     endif
+    let l:dirty_dir = s:refresh_data[a:key].dirty_dir
     let l:dirtyPath = substitute(l:dirtyPath, '/[^/]*$', '/', '')
-    while l:dirtyPath =~# '.\+/.*' && has_key(b:NERDTreeCachedGitDirtyDir, fnameescape(l:dirtyPath)) == 0
-        let b:NERDTreeCachedGitDirtyDir[fnameescape(l:dirtyPath)] = 'Dirty'
+    while l:dirtyPath =~# '.\+/.*' && has_key(l:dirty_dir, fnameescape(l:dirtyPath)) == 0
+        let l:dirty_dir[fnameescape(l:dirtyPath)] = 'Dirty'
         let l:dirtyPath = substitute(l:dirtyPath, '/[^/]*/$', '/', '')
     endwhile
 endfunction
@@ -218,18 +235,18 @@ function! s:NERDTreeTrimDoubleQuotes(pathStr)
     return l:toReturn
 endfunction
 
-" FUNCTION: g:NERDTreeGetGitStatusPrefix(path) {{{2
-" return the indicator of the path
+" FUNCTION: g:NERDTreeGetGitStatusPrefix(tree, path) {{{2
+" return the indicator of the path in the tree
 " Args: path
 let s:GitStatusCacheTimeExpiry = 2
 let s:GitStatusCacheTime = 0
-function! g:NERDTreeGetGitStatusPrefix(path)
+function! g:NERDTreeGetGitStatusPrefix(tree, path)
     if localtime() - s:GitStatusCacheTime > s:GitStatusCacheTimeExpiry
         let s:GitStatusCacheTime = localtime()
-        call g:NERDTreeGitStatusRefresh()
+        call g:NERDTreeGitStatusRefresh(a:tree)
     endif
     let l:pathStr = a:path.str()
-    let l:cwd = b:NERDTree.root.path.str() . a:path.Slash()
+    let l:cwd = a:tree.root.path.str() . a:path.Slash()
     if nerdtree#runningWindows()
         let l:pathStr = a:path.WinToUnixPath(l:pathStr)
         let l:cwd = a:path.WinToUnixPath(l:cwd)
@@ -237,10 +254,13 @@ function! g:NERDTreeGetGitStatusPrefix(path)
     let l:cwd = substitute(l:cwd, '\~', '\\~', 'g')
     let l:pathStr = substitute(l:pathStr, l:cwd, '', '')
     let l:statusKey = ''
+
+    let l:key = s:get_key(a:tree)
+    let l:refresh_data = s:refresh_data[l:key]
     if a:path.isDirectory
-        let l:statusKey = get(b:NERDTreeCachedGitDirtyDir, fnameescape(l:pathStr . '/'), '')
+        let l:statusKey = get(l:refresh_data.dirty_dir, fnameescape(l:pathStr . '/'), '')
     else
-        let l:statusKey = get(b:NERDTreeCachedGitFileStatus, fnameescape(l:pathStr), '')
+        let l:statusKey = get(l:refresh_data.file_status, fnameescape(l:pathStr), '')
     endif
     return s:NERDTreeGetIndicator(l:statusKey)
 endfunction
@@ -248,9 +268,13 @@ endfunction
 " FUNCTION: s:NERDTreeGetCWDGitStatus() {{{2
 " return the indicator of cwd
 function! g:NERDTreeGetCWDGitStatus()
-    if b:NOT_A_GIT_REPOSITORY
+    " TODO: is this the best thing to do here?
+    let l:key = s:get_key(b:NERDTree)
+
+    let l:refresh_data = s:refresh_data[l:key]
+    if l:refresh_data.not_git
         return ''
-    elseif b:NERDTreeCachedGitDirtyDir == {} && b:NERDTreeCachedGitFileStatus == {}
+    elseif l:refresh_data.dirty_dir == {} && l:refresh_data.file_status == {}
         return s:NERDTreeGetIndicator('Clean')
     endif
     return s:NERDTreeGetIndicator('Dirty')
